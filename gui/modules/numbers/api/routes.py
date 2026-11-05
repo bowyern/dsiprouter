@@ -2,12 +2,12 @@ import sys, os
 if sys.path[0] != '/etc/dsiprouter/gui':
     sys.path.insert(0, '/etc/dsiprouter/gui')
 
-from flask import Blueprint, session,render_template, request
+from flask import Blueprint, session,render_template, request, jsonify
 from modules.numbers.db.dsip_number import dSIPNumber
 from database import startSession, DummySession, InboundMapping
 from modules.api.api_functions import createApiResponse, showApiError, api_security
 from shared import getRequestData, rowToDict, showError, debugException, debugEndpoint
-from sqlalchemy import or_
+from sqlalchemy import or_, cast, String
 from werkzeug import exceptions as http_exceptions
 import settings
 import csv
@@ -61,49 +61,89 @@ def numbers_index():
 @numbers_api.route('/api/numbers/v1/number', methods=['GET'])
 @api_security
 def get_numbers():
-    """Get list of numbers. Supports query params: source, starts_with, contains, ends_with, status."""
+    """List a bounded page of numbers using the DataTables server-side protocol."""
     db = DummySession()
     try:
         db = startSession()
 
-        source = None
-        starts_with = None
-        contains = None
-        ends_with = None
-        status = None
+        payload = getRequestData() or {}
 
-        # extract from query string
-        payload = getRequestData()
-        pool= payload['pool'] if 'pool' in payload else None
-        source = payload['source'] if 'source' in payload else None
-        starts_with = ''.join(payload['starts_with']) if 'starts_with' in payload else None
-        contains = ''.join(payload['contains']) if 'contains' in payload else None
-        ends_with = ''.join(payload['ends_with']) if 'ends_with' in payload else None
-        status = payload['status'] if 'status' in payload else None
+        def scalar(key, default=None):
+            value = payload.get(key, default)
+            if isinstance(value, list):
+                if len(value) != 1:
+                    raise http_exceptions.BadRequest(f'{key} must have one value')
+                value = value[0]
+            return value
+
+        def integer(key, default, minimum):
+            try:
+                value = int(scalar(key, default))
+            except (TypeError, ValueError):
+                raise http_exceptions.BadRequest(f'{key} must be an integer')
+            if value < minimum:
+                raise http_exceptions.BadRequest(f'{key} must be at least {minimum}')
+            return value
+
+        draw = integer('draw', 0, 0)
+        start = integer('start', 0, 0)
+        length = min(integer('length', 25, 1), 500)
+
+        # Only known database columns can be searched or sorted. Column zero and
+        # the action columns in the UI are deliberately absent from this map.
+        columns = {
+            1: dSIPNumber.id, 2: dSIPNumber.did, 3: dSIPNumber.status,
+            4: dSIPNumber.carrier, 5: dSIPNumber.pool,
+            6: dSIPNumber.assigned_date, 7: dSIPNumber.assigned_length,
+            8: dSIPNumber.assigned_reference_id,
+        }
 
         q = db.query(dSIPNumber)
+        total = q.count()
 
-        if source:
-            # support using source as either carrier or pool
-            q = q.filter(dSIPNumber.carrier == source)
+        for key, column in (('source', dSIPNumber.carrier),
+                            ('status', dSIPNumber.status), ('pool', dSIPNumber.pool)):
+            value = scalar(key)
+            if value:
+                q = q.filter(column == value)
+        for key, match in (('starts_with', dSIPNumber.did.startswith),
+                           ('contains', dSIPNumber.did.contains),
+                           ('ends_with', dSIPNumber.did.endswith)):
+            value = scalar(key)
+            if value:
+                q = q.filter(match(value, autoescape=True))
 
-        if starts_with:
-            #q = q.filter(dSIPNumber.did.like(f"{starts_with}%"))
-            q = q.filter(dSIPNumber.did.like(f"{starts_with}%"))
-        if contains:
-            q = q.filter(dSIPNumber.did.like(f"%{contains}%"))
-        if ends_with:
-            q = q.filter(dSIPNumber.did.like(f"%{ends_with}"))
-        if status is not None and status != '':
-            q = q.filter(dSIPNumber.status == status)
-        if pool:
-            q = q.filter(dSIPNumber.pool == pool)
+        search = scalar('search[value]', '')
+        if search:
+            # Match each whitespace-separated term across the displayed fields,
+            # as the previous client-side global search did.
+            for term in search.split():
+                q = q.filter(or_(*(cast(column, String).icontains(term, autoescape=True)
+                                  for column in columns.values())))
+        filtered = q.count()
 
-        results = q.all()
+        ordering = []
+        for index in range(len(columns)):
+            key = f'order[{index}][column]'
+            if key not in payload:
+                break
+            column_id = integer(key, 1, 0)
+            direction = scalar(f'order[{index}][dir]', 'asc')
+            if column_id not in columns or direction not in ('asc', 'desc'):
+                raise http_exceptions.BadRequest('Invalid sort column or direction')
+            column = columns[column_id]
+            ordering.append(column.desc() if direction == 'desc' else column.asc())
+
+        # A unique tie-breaker keeps page boundaries stable when values repeat.
+        results = q.order_by(*ordering, dSIPNumber.id.asc()).offset(start).limit(length).all()
         data = [rowToDict(r) for r in results]
         count = len(data)
 
-        return createApiResponse(msg=str(count) + ' Numbers Retrieved', data=data)
+        response, status_code = createApiResponse(msg=str(count) + ' Numbers Retrieved', data=data)
+        body = response.get_json()
+        body.update(draw=draw, recordsTotal=total, recordsFiltered=filtered,
+                    start=start, length=length)
+        return jsonify(body), status_code
 
     except Exception as ex:
         db.rollback()

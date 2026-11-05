@@ -23,6 +23,16 @@
   // global variables/constants for this script
   var numbers_table;
 
+  function refreshNumbers() {
+    numbers_table.ajax.reload(function() {
+      var info = numbers_table.page.info();
+      // Deleting the final row on a page can leave the current offset past the
+      // end of the result set. Fetch the last remaining page in that case.
+      if (info.start > 0 && info.start >= info.recordsDisplay) {
+        numbers_table.page(info.pages > 0 ? 'last' : 'first').draw('page');
+      }
+    }, false);
+  }
 
 
  // Add or Update Number
@@ -91,35 +101,10 @@
           reloadKamRequired(true);
         }
 
+        refreshNumbers();
         if (action === "POST") {
-          numbers_table.row.add({
-            "id": response.data[0].id,
-            "did": requestPayload.did,
-            "status": requestPayload.status,
-            "carrier": requestPayload.carrier,
-            "pool": requestPayload.pool,
-            "assigned_date": response.data[0].assigned_date,
-            "assigned_length": requestPayload.assigned_length,
-            "assigned_reference_id": requestPayload.assigned_reference_id
-          }).draw();
-
           // Clear the form fields for next entry
            clearFormFields("#add");
-        }
-         
-        else {
-          numbers_table.row(function(idx, data, node) {
-            return data.id === response.data[0].id;
-          }).data({
-            "id": response.data[0].id,
-            "did": requestPayload.did,
-            "status": requestPayload.status,
-            "carrier": requestPayload.carrier,
-            "pool": requestPayload.pool,
-            "assigned_date": response.data[0].assigned_date,
-            "assigned_length": requestPayload.assigned_length,
-            "assigned_reference_id": requestPayload.assigned_reference_id
-          }).draw();
         }
 
        
@@ -153,9 +138,7 @@
         // Update Reload buttons
         reloadKamRequired(true);
 
-        numbers_table.row(function(idx, data, node) {
-          return data.id === id_int
-        }).remove().draw();
+        refreshNumbers();
       },
       error: function(jqXHR, textStatus, errorThrown) {
         showNotification("Delete Failed: " + jqXHR.responseText, true);
@@ -184,18 +167,12 @@
       contentType: "application/json; charset=utf-8",
       data: JSON.stringify(requestPayload),
       success: function(response, textStatus, jqXHR) {
-        $('#bulk-delete').modal('hide');
+        $('#delete').modal('hide');
 
         // Update Reload buttons
         //reloadKamRequired(true);
 
-        // Remove deleted rows from table
-        ids.forEach(function(id_int) {
-          numbers_table.row(function(idx, data, node) {
-            return parseInt(data.id, 10) === id_int;
-          }).remove();
-        });
-        numbers_table.draw();
+        refreshNumbers();
 
         showNotification("Bulk Delete Successful: Deleted " + response.data.length + " numbers.");
       },
@@ -233,7 +210,7 @@
       contentType: false,
       success: function(response, textStatus, jqXHR) {
         showNotification("Import Successful: "  + response.msg);
-        numbers_table.ajax.reload();
+        refreshNumbers();
         clearFormFields("#import");
       },
       error: function(jqXHR, textStatus, errorThrown) {
@@ -250,12 +227,15 @@ $(document).ready(function() {
 
     // datatable init
     numbers_table = $('#numbers-table').DataTable({
+      "serverSide": true,
+      "processing": true,
+      "searchDelay": 350,
       "ajax": {
         "url": CUSTOM_MODULE_API_BASE_URL + "numbers/v1/number",
         "dataSrc": "data"
       },
       "columns": [
-        {"data": null,
+        {"data": null, "orderable": false, "searchable": false,
           render: function (data, type, row) {
         return `<input type="checkbox" class="row-check" value="${row.id}">`;
       }
@@ -268,13 +248,13 @@ $(document).ready(function() {
         {"data": "assigned_date"},
         {"data": "assigned_length"},
         {"data": "assigned_reference_id"},
-        {"data": null,
+        {"data": null, "orderable": false, "searchable": false,
           render: function (data, type, row) {
           return `<button id="open-Update" class="open-Update btn btn-primary btn-sm" data-title="Edit" data-bs-toggle="modal"
           data-bs-target="#edit"><i class="ti ti-pencil"></i></button>`;
           }
         },
-        {"data": null,
+        {"data": null, "orderable": false, "searchable": false,
           render: function (data, type, row) {
           return `<button id="open-Delete" class="open-Delete btn btn-danger btn-sm" data-title="Delete" data-bs-toggle="modal"
           data-bs-target="#delete"><i class="ti ti-trash"></i></button>`;
@@ -300,7 +280,11 @@ $(document).ready(function() {
 
     $('#numbers-table tbody').on('click', 'button.open-Delete', function() {
       var data = numbers_table.row($(this).parents('tr')).data();
-      $('input#id').val(data.id);
+      $('#delete input#id').val(data.id);
+    });
+
+    $('#open-BulkDelete').click(function() {
+      $('#delete input#id').val('');
     });
 
      /* validate fields before submitting api request */
@@ -356,10 +340,6 @@ $(document).ready(function() {
       }
 
 
-      numbers_table.row(function(idx, data, node) {
-        return data.id === id;
-      }).remove().draw()
-      
     });
 
     $('#importButton').click(function(ev) {

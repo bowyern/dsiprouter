@@ -76,6 +76,36 @@ Delete a route (paired ``dsip_lcr`` row, if any, is removed automatically):
 
     curl -k -H "Authorization: Bearer $DSIP_TOKEN" -X DELETE https://$DSIP_HOSTNAME:5000/api/v1/outboundroutes/<ruleid>
 
+Listing Numbers
+---------------
+
+``GET /api/numbers/v1/number`` returns a bounded page. The default is 25
+records; use ``start`` (zero-based offset) and ``length`` (1–500) to retrieve
+other pages. Larger lengths are capped at 500; ``length=-1`` is not supported.
+Clients that previously expected the entire inventory must now iterate pages.
+
+.. code-block:: bash
+
+    curl -k -H "Authorization: Bearer $DSIP_TOKEN" \
+         "https://$DSIP_HOSTNAME:5000/api/numbers/v1/number?start=25&length=25"
+
+The response retains ``data``, ``msg``, ``error``, and reload flags, and adds
+``start``, ``length``, ``recordsTotal`` (inventory size), ``recordsFiltered``
+(matches before pagination), and ``draw`` (the supplied DataTables request
+counter, or zero). An empty page still includes these counts.
+
+Existing filters are supported: ``source`` matches the carrier, ``pool`` and
+``status`` match exactly, and ``starts_with``, ``contains``, and ``ends_with``
+match the DID. ``search[value]`` searches the displayed columns, matching each
+whitespace-separated term. Search text is literal, not SQL wildcards or regex.
+
+DataTables ordering uses ``order[0][column]`` and ``order[0][dir]`` (``asc`` or
+``desc``); additional ordered columns use indices 1, 2, etc. Column IDs are:
+1 = ID, 2 = DID, 3 = status, 4 = carrier, 5 = pool, 6 = assigned date,
+7 = assigned length, 8 = assigned reference ID. The default order is ID
+ascending, with ID also used to break ties. Invalid paging or ordering returns
+HTTP 400. The Numbers UI uses this protocol for paging, searching and sorting.
+
 Further Reading
 +++++++++++++++
 
