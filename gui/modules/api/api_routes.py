@@ -15,7 +15,6 @@ from werkzeug.utils import secure_filename
 from database import startSession, DummySession, Address, dSIPNotification, dSIPMultiDomainMapping, Gateways, \
     GatewayGroups, Subscribers, dSIPLeases, dSIPMaintModes, dSIPCallSettings, InboundMapping, dSIPCDRInfo, \
     dSIPCertificates, Dispatcher, dSIPDNIDEnrichment, getDsipSettingsTableAsDict, updateDsipSettingsTable
-from modules.numbers.db.dsip_number import dSIPNumber
 from shared import allowed_file, dictToStrFields, isCertValid, rowToDict, debugEndpoint, StatusCodes, \
     strFieldsToDict, getRequestData, IO, objToDict, getAllowedSettings,updateDsipLocalSettingsFromDict, \
     updateConfig
@@ -23,6 +22,7 @@ from util.pyasync import daemonize
 from util.ipc import STATE_SHMEM_NAME, getSharedMemoryDict
 from modules.api.api_functions import createApiResponse, showApiError, api_security
 from modules.api.kamailio.functions import reloadKamailio
+from modules.api.inboundmapping.routes import handleInboundMappingRequest
 from util.networking import getExternalIP, hostToIP, isValidIP, parseGenericUri, safeUriToHost, safeStripPort, check_host_type
 from util.notifications import sendEmail
 from util.security import AES_CTR, urandomChars, KeyCertPair
@@ -34,22 +34,6 @@ from sysloginit import initSyslogLogger
 import settings
 
 api = Blueprint('api', __name__)
-
-
-def _sync_number_status_from_inbound_route(db, did, gwlist):
-    normalized_did = did.lstrip('+') if did else ''
-    if not normalized_did:
-        return
-
-    number = db.query(dSIPNumber).filter(
-        or_(
-            dSIPNumber.did == normalized_did,
-            dSIPNumber.did == '+' + normalized_did,
-        )
-    ).first()
-
-    if number is not None:
-        number.status = 'assigned' if gwlist else 'available'
 
 
 # TODO: we need to abstract out common code between gui and api
@@ -476,286 +460,11 @@ def updateEndpoint(id):
         db.close()
 
 
-# TODO: we should optimize this and cleanup reused code
 @api.route("/api/v1/inboundmapping", methods=['GET', 'POST', 'PUT', 'DELETE'])
 @api_security
 def handleInboundMapping():
-    """
-    Endpoint for Inbound DID Rule Mapping
-    """
-
-    db = DummySession()
-
-    # use a whitelist to avoid possible SQL Injection vulns
-    VALID_REQUEST_ARGS = {'ruleid', 'did'}
-
-    # use a whitelist to avoid possible buffer overflow vulns or crashes
-    VALID_REQUEST_DATA_ARGS = {'did', 'servers', 'name'}
-
-    payload = {'data': []}
-
-    try:
-        if (settings.DEBUG):
-            debugEndpoint()
-
-        db = startSession()
-
-        # =========================================
-        # get rule for DID mapping or list of rules
-        # =========================================
-        if request.method == "GET":
-            # sanity check
-            for arg in request.args:
-                if arg not in VALID_REQUEST_ARGS:
-                    raise http_exceptions.BadRequest("Request argument not recognized")
-
-            # get single rule by ruleid
-            rule_id = request.args.get('ruleid')
-            if rule_id is not None:
-                res = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).filter(
-                    InboundMapping.ruleid == rule_id).first()
-                if res is not None:
-                    data = rowToDict(res)
-                    data = {'ruleid': data['ruleid'], 'did': data['prefix'],
-                            'name': strFieldsToDict(data['description'])['name'] if 'name' in strFieldsToDict(
-                                data['description']) else '',
-                            'servers': data['gwlist'].split(',')}
-                    payload['data'].append(data)
-                    payload['msg'] = 'Rule Found'
-                else:
-                    payload['msg'] = 'No Matching Rule Found'
-                    payload['status_code'] = StatusCodes.HTTP_NOT_FOUND
-
-            # get single rule by did
-            else:
-                did_pattern = request.args.get('did')
-                if did_pattern is not None:
-                    res = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).filter(
-                        InboundMapping.prefix == did_pattern).first()
-                    if res is not None:
-                        data = rowToDict(res)
-                        data = {'ruleid': data['ruleid'], 'did': data['prefix'],
-                                'name': strFieldsToDict(data['description'])['name'] if 'name' in strFieldsToDict(
-                                    data['description']) else '',
-                                'servers': data['gwlist'].split(',')}
-                        payload['data'].append(data)
-                        payload['msg'] = 'DID Found'
-                    else:
-                        payload['msg'] = 'No Matching DID Found'
-                        payload['status_code'] = StatusCodes.HTTP_NOT_FOUND
-
-                # get list of rules
-                else:
-                    res = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).all()
-                    if len(res) > 0:
-                        for row in res:
-                            data = rowToDict(row)
-                            data = {'ruleid': data['ruleid'], 'did': data['prefix'],
-                                    'name': strFieldsToDict(data['description'])['name'] if 'name' in strFieldsToDict(
-                                        data['description']) else '',
-                                    'servers': data['gwlist'].split(',')}
-                            payload['data'].append(data)
-                        payload['msg'] = 'Rules Found'
-                    else:
-                        payload['msg'] = 'No Rules Found'
-
-            return createApiResponse(**payload)
-
-        # ===========================
-        # create rule for DID mapping
-        # ===========================
-        elif request.method == "POST":
-            data = getRequestData()
-
-            # sanity checks
-            for arg in data:
-                if arg not in VALID_REQUEST_DATA_ARGS:
-                    raise http_exceptions.BadRequest("Request data argument not recognized")
-
-            if 'servers' not in data:
-                raise http_exceptions.BadRequest('Servers to map DID to are required')
-            elif len(data['servers']) < 1 or len(data['servers']) > 2:
-                raise http_exceptions.BadRequest('Primary Server missing or More than 2 Servers Provided')
-            elif 'did' not in data:
-                raise http_exceptions.BadRequest('DID is required')
-
-            # TODO: we should be checking dr_gateways table to make sure the servers exist
-            for i in range(0, len(data['servers'])):
-                try:
-                    data['servers'][i] = str(data['servers'][i])
-                    # _ = int(data['servers'][i])
-                except:
-                    raise http_exceptions.BadRequest('Invalid Server ID')
-            for c in data['did']:
-                if c not in settings.DID_PREFIX_ALLOWED_CHARS:
-                    raise http_exceptions.BadRequest(
-                        'DID improperly formatted. Allowed characters: {}'.format(
-                            ','.join(settings.DID_PREFIX_ALLOWED_CHARS)))
-
-            gwlist = ','.join(data['servers'])
-            prefix = data['did']
-            description = 'name:{}'.format(data['name']) if 'name' in data else ''
-
-            # don't allow duplicate entries
-            if db.query(InboundMapping).filter(InboundMapping.prefix == prefix).filter(
-                InboundMapping.groupid == settings.FLT_INBOUND).scalar():
-                raise http_exceptions.BadRequest("Duplicate DID's are not allowed")
-            IMap = InboundMapping(settings.FLT_INBOUND, prefix, gwlist, description)
-            db.add(IMap)
-            _sync_number_status_from_inbound_route(db, prefix, gwlist)
-
-            db.commit()
-            getSharedMemoryDict(STATE_SHMEM_NAME)['kam_reload_required'] = True
-            payload['kamreload'] = getSharedMemoryDict(STATE_SHMEM_NAME)['kam_reload_required']
-            payload['msg'] = 'Rule Created'
-            return createApiResponse(**payload)
-
-        # ===========================
-        # update rule for DID mapping
-        # ===========================
-        elif request.method == "PUT":
-            # sanity check
-            for arg in request.args:
-                if arg not in VALID_REQUEST_ARGS:
-                    raise http_exceptions.BadRequest("Request argument not recognized")
-
-            data = getRequestData()
-            updates = {}
-
-            # sanity checks
-            for arg in data:
-                if arg not in VALID_REQUEST_DATA_ARGS:
-                    raise http_exceptions.BadRequest("Request data argument not recognized")
-
-            if 'did' not in data and 'servers' not in data and 'name' not in data:
-                raise http_exceptions.BadRequest("No data args supplied, {did, and servers} is required")
-            # TODO: we should be checking dr_gateways table to make sure the servers exist
-            if 'servers' in data:
-                if len(data['servers']) < 1 or len(data['servers']) > 2:
-                    raise http_exceptions.BadRequest('Primary Server missing or More than 2 Servers Provided')
-                else:
-                    for i in range(0, len(data['servers'])):
-                        try:
-                            data['servers'][i] = str(data['servers'][i])
-                            # _ = int(data['servers'][i])
-                        except:
-                            raise http_exceptions.BadRequest('Invalid Server ID')
-                updates['gwlist'] = ','.join(data['servers'])
-            if 'did' in data:
-                for c in data['did']:
-                    if c not in settings.DID_PREFIX_ALLOWED_CHARS:
-                        raise http_exceptions.BadRequest(
-                            'DID improperly formatted. Allowed characters: {}'.format(
-                                ','.join(settings.DID_PREFIX_ALLOWED_CHARS)))
-                updates['prefix'] = data['did']
-            if 'name' in data:
-                updates['description'] = 'name:{}'.format(data['name'])
-
-            # update single rule by ruleid
-            rule_id = request.args.get('ruleid')
-            if rule_id is not None:
-                res = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).filter(
-                    InboundMapping.ruleid == rule_id).update(
-                    updates, synchronize_session=False)
-                if res > 0:
-                    payload['msg'] = 'Rule Updated'
-                else:
-                    payload['msg'] = 'No Matching Rule Found'
-
-            # update single rule by did
-            else:
-                did_pattern = request.args.get('did')
-                if did_pattern is not None:
-                    res = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).filter(
-                        InboundMapping.prefix == did_pattern).update(
-                        updates, synchronize_session=False)
-                    if res > 0:
-                        payload['msg'] = 'Rule Updated'
-                    else:
-                        payload['msg'] = 'No Matching Rule Found'
-
-                # no other options
-                else:
-                    raise http_exceptions.BadRequest('One of the following is required: {ruleid, or did}')
-
-            route_row = None
-            if rule_id is not None:
-                route_row = db.query(InboundMapping).filter(
-                    InboundMapping.groupid == settings.FLT_INBOUND,
-                    InboundMapping.ruleid == rule_id
-                ).first()
-            elif did_pattern is not None:
-                route_row = db.query(InboundMapping).filter(
-                    InboundMapping.groupid == settings.FLT_INBOUND,
-                    InboundMapping.prefix == did_pattern
-                ).first()
-
-            if route_row is not None:
-                _sync_number_status_from_inbound_route(db, route_row.prefix, route_row.gwlist)
-
-            db.commit()
-            getSharedMemoryDict(STATE_SHMEM_NAME)['kam_reload_required'] = True
-            payload['kamreload'] = getSharedMemoryDict(STATE_SHMEM_NAME)['kam_reload_required']
-            return createApiResponse(**payload)
-
-        # ===========================
-        # delete rule for DID mapping
-        # ===========================
-        elif request.method == "DELETE":
-            # sanity check
-            for arg in request.args:
-                if arg not in VALID_REQUEST_ARGS:
-                    raise http_exceptions.BadRequest("Request argument not recognized")
-
-            # delete single rule by ruleid
-            rule_id = request.args.get('ruleid')
-            if rule_id is not None:
-                rule = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).filter(
-                    InboundMapping.ruleid == rule_id)
-                rule_row = rule.first()
-                if rule.delete(synchronize_session=False) == 0:
-                    payload['msg'] = 'No Rules Found'
-                    payload['status_code'] = StatusCodes.HTTP_NOT_FOUND
-                elif rule_row is not None:
-                    _sync_number_status_from_inbound_route(db, rule_row.prefix, '')
-
-            # delete single rule by did
-            else:
-                did_pattern = request.args.get('did')
-                if did_pattern is not None:
-                    rule = db.query(InboundMapping).filter(InboundMapping.groupid == settings.FLT_INBOUND).filter(
-                        InboundMapping.prefix == did_pattern)
-                    rule_row = rule.first()
-                    if rule.delete(synchronize_session=False) == 0:
-                        payload['msg'] = 'No Rules Found'
-                        payload['status_code'] = StatusCodes.HTTP_NOT_FOUND
-                    elif rule_row is not None:
-                        _sync_number_status_from_inbound_route(db, rule_row.prefix, '')
-
-                # no other options
-                else:
-                    raise http_exceptions.BadRequest('One of the following is required: {ruleid, or did}')
-
-            db.commit()
-            getSharedMemoryDict(STATE_SHMEM_NAME)['kam_reload_required'] = True
-            payload['kamreload'] = True
-            payload['msg'] = 'Rule Deleted'
-            return createApiResponse(**payload)
-
-        # not possible
-        else:
-            payload['msg'] = 'Invalid HTTP method for this route'
-            return createApiResponse(
-                **payload,
-                status_code=StatusCodes.HTTP_METHOD_NOT_ALLOWED
-            )
-
-    except Exception as ex:
-        db.rollback()
-        db.flush()
-        return showApiError(ex)
-    finally:
-        db.close()
+    """Manage inbound routes, endpoint-group selection and hard/failover forwarding."""
+    return handleInboundMappingRequest()
 
 
 @api.route("/api/v1/notification/gwgroup", methods=['POST'])
